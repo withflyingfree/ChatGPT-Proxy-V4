@@ -1,10 +1,16 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"io"
 	"log"
+	"net/url"
 	"os"
+	"strings"
 	"time"
+
+	arkose "github.com/acheong08/funcaptcha"
 
 	http "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
@@ -23,14 +29,15 @@ var (
 	jar     = tls_client.NewCookieJar()
 	options = []tls_client.HttpClientOption{
 		tls_client.WithTimeoutSeconds(360),
-		tls_client.WithClientProfile(tls_client.Safari_IOS_16_0),
+		tls_client.WithClientProfile(tls_client.Firefox_110),
 		tls_client.WithNotFollowRedirects(),
 		tls_client.WithCookieJar(jar), // create cookieJar instance and pass it as argument
 	}
 	client, _      = tls_client.NewHttpClient(tls_client.NewNoopLogger(), options...)
-	user_agent     = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36"
+	user_agent     = "Mozilla/5.0 (X11; Linux x86_64; rv:114.0) Gecko/20100101 Firefox/114.0"
 	http_proxy     = os.Getenv("http_proxy")
 	authorizations auth_struct
+	OpenAI_HOST    = os.Getenv("OPENAI_HOST")
 )
 
 func admin(c *gin.Context) {
@@ -43,6 +50,9 @@ func admin(c *gin.Context) {
 }
 
 func init() {
+	if OpenAI_HOST == "" {
+		OpenAI_HOST = "chat.openai.com"
+	}
 	authorizations.OpenAI_Email = os.Getenv("OPENAI_EMAIL")
 	authorizations.OpenAI_Password = os.Getenv("OPENAI_PASSWORD")
 	if authorizations.OpenAI_Email != "" && authorizations.OpenAI_Password != "" {
@@ -60,14 +70,23 @@ func init() {
 				}
 				os.Setenv("PUID", puid)
 				println(puid)
+				client.SetCookies(&url.URL{
+					Host: OpenAI_HOST,
+				}, []*http.Cookie{
+					{
+						Name:  "_puid",
+						Value: puid,
+					},
+				})
 				time.Sleep(24 * time.Hour * 7)
 			}
 		}()
 	}
+	// arkose.SetTLSClient(&client)
 }
 
 func main() {
-
+    log.Printf("starting!")
 	if http_proxy != "" {
 		client.SetProxy(http_proxy)
 		println("Proxy set:" + http_proxy)
@@ -78,6 +97,7 @@ func main() {
 		PORT = "9090"
 	}
 	handler := gin.Default()
+
 	handler.GET("/ping", func(c *gin.Context) {
 		c.JSON(200, gin.H{"message": "pong"})
 	})
@@ -120,7 +140,6 @@ func main() {
 		os.Setenv("OPENAI_EMAIL", authorizations.OpenAI_Email)
 		os.Setenv("OPENAI_PASSWORD", authorizations.OpenAI_Password)
 	})
-
 	handler.Any("/api/*path", proxy)
 
 	gin.SetMode(gin.ReleaseMode)
@@ -128,9 +147,6 @@ func main() {
 }
 
 func proxy(c *gin.Context) {
-	// Remove _cfuvid cookie from session
-	jar.SetCookies(c.Request.URL, []*http.Cookie{})
-
 	var url string
 	var err error
 	var request_method string
@@ -138,43 +154,93 @@ func proxy(c *gin.Context) {
 	var response *http.Response
 
 	if c.Request.URL.RawQuery != "" {
-		url = "https://chat.openai.com/backend-api" + c.Param("path") + "?" + c.Request.URL.RawQuery
+		url = "https://" + OpenAI_HOST + "/backend-api" + c.Param("path") + "?" + c.Request.URL.RawQuery
 	} else {
-		url = "https://chat.openai.com/backend-api" + c.Param("path")
+		url = "https://" + OpenAI_HOST + "/backend-api" + c.Param("path")
 	}
 	request_method = c.Request.Method
 
-	request, err = http.NewRequest(request_method, url, c.Request.Body)
-	if err != nil {
-		c.JSON(500, gin.H{"error": err.Error()})
-		return
+	if c.Request.URL.Path == "/api/conversation" {
+		var request_body map[string]interface{}
+		if c.Request.Body != nil {
+			err := json.NewDecoder(c.Request.Body).Decode(&request_body)
+			if err != nil {
+				c.JSON(400, gin.H{"error": "JSON invalid"})
+				return
+			}
+		}
+		// Check if "model" is in the request json
+		if _, ok := request_body["model"]; !ok {
+			c.JSON(400, gin.H{"error": "model not provided"})
+			return
+		}
+		// if strings.HasPrefix(request_body["model"].(string), "gpt-4") {
+		// 	if _, ok := request_body["arkose_token"]; !ok {
+		// 		log.Println("arkose token not provided")
+		// 		token, _, err := arkose.GetOpenAIToken()
+		// 		var arkose_token string
+		// 		if err != nil {
+		// 			c.JSON(500, gin.H{"error": err.Error()})
+		// 			return
+		// 		}
+		// 		arkose_token = token
+		// 		request_body["arkose_token"] = arkose_token
+		// 	}
+		// }
+		//每次都放进去arkose_token试试
+		if _, ok := request_body["arkose_token"]; !ok {
+			log.Println("arkose token not provided")
+			token, _, err := arkose.GetOpenAIToken()
+			var arkose_token string
+			if err != nil {
+				c.JSON(500, gin.H{"error": err.Error()})
+				return
+			}
+			arkose_token = token
+			request_body["arkose_token"] = arkose_token
+		}
+
+		body_json, err := json.Marshal(request_body)
+		if err != nil {
+			c.JSON(500, gin.H{"error": err.Error()})
+			return
+		}
+		original_body := bytes.NewReader(body_json)
+		//输出请求体original_body 都是数字艹，回来再说吧
+		//log.Println("original_body:%v",original_body)
+		request, _ = http.NewRequest(request_method, url, original_body)
+	} else {
+		request, _ = http.NewRequest(request_method, url, c.Request.Body)
 	}
-	request.Header.Set("Host", "chat.openai.com")
-	request.Header.Set("Origin", "https://chat.openai.com/chat")
+	request.Header.Set("Host", ""+OpenAI_HOST+"")
+	request.Header.Set("Origin", "https://"+OpenAI_HOST)
 	request.Header.Set("Connection", "keep-alive")
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Keep-Alive", "timeout=360")
 	request.Header.Set("Authorization", c.Request.Header.Get("Authorization"))
-	request.Header.Set("sec-ch-ua", "\"Chromium\";v=\"112\", \"Brave\";v=\"112\", \"Not:A-Brand\";v=\"99\"")
-	request.Header.Set("sec-ch-ua-mobile", "?0")
-	request.Header.Set("sec-ch-ua-platform", "\"Linux\"")
-	request.Header.Set("sec-fetch-dest", "empty")
-	request.Header.Set("sec-fetch-mode", "cors")
-	request.Header.Set("sec-fetch-site", "same-origin")
-	request.Header.Set("sec-gpc", "1")
-	request.Header.Set("user-agent", user_agent)
-	if os.Getenv("PUID") != "" {
-		request.Header.Set("cookie", "_puid="+os.Getenv("PUID")+";")
+	request.Header.Set("Sec-Ch-Ua", "\"Chromium\";v=\"118\", \"Google Chrome\";v=\"118\", \"Not:A-Brand\";v=\"99\"")
+	request.Header.Set("Sec-Ch-Ua-Mobile", "?0")
+	request.Header.Set("Sec-Ch-Ua-Platform", "\"Windows\"")
+	request.Header.Set("Sec-Fetch-Dest", "empty")
+	request.Header.Set("Sec-Fetch-Mode", "cors")
+	request.Header.Set("Sec-Fetch-Site", "same-origin")
+	//request.Header.Set("sec-gpc", "1")
+	request.Header.Set("User-Agent", user_agent)
+	if c.Request.Header.Get("PUID") != "" {
+		request.Header.Set("cookie", "_puid="+c.Request.Header.Get("PUID")+";")
 	}
-
 	response, err = client.Do(request)
 	if err != nil {
+                log.Printf("Error after client.Do: %v", err)
 		c.JSON(500, gin.H{"error": err.Error()})
 		return
 	}
 	defer response.Body.Close()
 	// Copy headers from response
 	for k, v := range response.Header {
+		if strings.ToLower(k) == "content-encoding" {
+			continue
+		}
 		c.Header(k, v[0])
 	}
 	// Get status code
